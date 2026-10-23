@@ -32,7 +32,10 @@ class PlaybackState private constructor() {
         val hasLyric: Boolean,
         val sequence: Long,
         val updatedAtMs: Long,
-    )
+    ) {
+        /** 是否已拿到可用的曲目信息。Minecraft 端据此判断要不要发起歌词匹配。 */
+        fun hasTrack(): Boolean = title.isNotEmpty() || artist.isNotEmpty()
+    }
 
     @Volatile private var title: String = ""
     @Volatile private var artist: String = ""
@@ -61,21 +64,36 @@ class PlaybackState private constructor() {
         hostState = value.name
     }
 
-    /** 宿主换曲时调用，一次性更新全部曲目字段。 */
+    /** 是否已拿到可用的曲目信息。用于判断空查询结果该不该被采纳。 */
+    fun hasTrack(): Boolean = title.isNotEmpty() || artist.isNotEmpty()
+
+    /**
+     * 更新曲目信息。
+     *
+     * 两条纪律：
+     * 1. 空对象（无 title 也无 artist）视为「本次查询无结果」，**整体忽略**。
+     *    宿主 `getCurrentMediaItem()` 在部分状态下会返回这种空对象，
+     *    若照单全收会在每轮状态变化时清掉刚拿到的曲目与歌词。
+     * 2. 只有曲目标识真的变化时才清空歌词。同一首歌重复上报不该触发清空，
+     *    否则歌词会在播放中反复消失又重建。
+     */
     fun setMediaItem(item: PlaybackExtensionPoint.MediaItem?) {
-        if (item == null) {
-            title = ""
-            artist = ""
-            album = ""
-            durationMs = 0L
-        } else {
-            title = item.title
-            artist = item.artist
-            album = item.album
-            durationMs = if (item.duration < 0L) 0L else item.duration
-        }
+        if (item == null) return
+
+        val newTitle = item.title
+        val newArtist = item.artist
+        if (newTitle.isEmpty() && newArtist.isEmpty()) return
+
+        val trackChanged = newTitle != title || newArtist != artist
+        title = newTitle
+        artist = newArtist
+        album = item.album
+        durationMs = if (item.duration < 0L) 0L else item.duration
+
         // 换曲必须清空旧歌词，否则新歌会短暂显示上一首的内容
-        lyrics = emptyList()
+        if (trackChanged) {
+            lyrics = emptyList()
+        }
         bump()
     }
 

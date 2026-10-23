@@ -64,25 +64,41 @@ object SelfCheck {
             check("不声明队列能力", !body.contains("QUEUE"))
             check("不声明按索引播放", !body.contains("PLAY_BY_INDEX"))
 
-            // 3. 换曲必须清空旧歌词
+            // 3. 空 MediaItem 必须被整体忽略（宿主 getCurrentMediaItem 会返回空对象）
+            PlaybackState.INSTANCE.setMediaItem(
+                PlaybackExtensionPoint.MediaItem("", "", "", "", ""),
+            )
+            body = get(port, "/lyric")
+            check("空 MediaItem 不清掉曲目", body.contains("\"title\":\"歌\\t名\""))
+            check("空 MediaItem 不清掉歌词", body.contains("\"text\":\"你好\""))
+
+            // 4. 同一首歌重复上报不得清空歌词
+            PlaybackState.INSTANCE.setMediaItem(
+                PlaybackExtensionPoint.MediaItem("歌\t名", "艺\"术家", "专辑", "", ""),
+            )
+            body = get(port, "/lyric")
+            check("同曲重复上报保留歌词", body.contains("\"text\":\"你好\""))
+
+            // 5. 真正换曲时必须清空旧歌词
             PlaybackState.INSTANCE.setMediaItem(
                 PlaybackExtensionPoint.MediaItem("新歌", "新家", "", "", ""),
             )
             body = get(port, "/lyric")
             check("换曲清空歌词", body.contains("\"lines\":[]"))
             check("换曲后不再声明歌词能力", !body.contains("INLINE_LYRIC"))
+            check("换曲后曲目已更新", body.contains("\"title\":\"新歌\""))
 
-            // 4. 未知路径
+            // 6. 未知路径
             check("未知路径返回 404", status(port, "/nope") == 404)
 
-            // 5. 命令：未知动作被拒
+            // 7. 命令：未知动作被拒
             check("未知动作返回失败", post(port, "/lyric/command", """{"action":"playAt","index":3}""")
                 .contains("\"ok\":false"))
 
-            // 6. 命令：GET 方法被拒
+            // 8. 命令：GET 方法被拒
             check("GET 命令返回 405", status(port, "/lyric/command") == 405)
 
-            // 7. 畸形请求体不崩
+            // 9. 畸形请求体不崩
             check("空体返回失败", post(port, "/lyric/command", "").contains("\"ok\":false"))
             check("畸形 JSON 不抛异常", post(port, "/lyric/command", "{{{").contains("\"ok\":false"))
         } finally {
