@@ -1,0 +1,16 @@
+.gradle/
+build/
+.idea/
+*.iml
+out/
+run/
+logs/
+local.properties
+*.hprof
+.vscode/
+
+# 保留 wrapper jar
+!gradle/wrapper/gradle-wrapper.jar
+
+.DS_Store
+Thumbs.db

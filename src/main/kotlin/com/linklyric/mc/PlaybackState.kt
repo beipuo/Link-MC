@@ -1,0 +1,108 @@
+package com.linklyric.mc
+
+import com.xuncorp.spw.workshop.api.PlaybackExtensionPoint
+import com.xuncorp.spw.workshop.api.WorkshopApi
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * 全局播放状态容器。
+ *
+ * 写入方是宿主回调线程（位置每秒一次、歌词在 IO 线程），读取方是 HTTP 线程。
+ * 因此不逐字段加锁，而是 volatile 字段 + 读取时组装不可变快照：
+ * 位置类数据允许几十毫秒不一致（对渲染无影响），换曲由序号判断新鲜度。
+ *
+ * 歌词时间轴单独持有：它只在换曲/重载时变化，体积远大于其它字段，
+ * 不能放进 [Snapshot] 一起复制。
+ */
+class PlaybackState private constructor() {
+
+    companion object {
+        val INSTANCE = PlaybackState()
+    }
+
+    /** 一次读取得到的不可变快照，不含歌词正文（歌词另行读取）。 */
+    data class Snapshot(
+        val title: String,
+        val artist: String,
+        val album: String,
+        val durationMs: Long,
+        val positionMs: Long,
+        val playing: Boolean,
+        val hostState: String,
+        val hasLyric: Boolean,
+        val sequence: Long,
+        val updatedAtMs: Long,
+    )
+
+    @Volatile private var title: String = ""
+    @Volatile private var artist: String = ""
+    @Volatile private var album: String = ""
+    @Volatile private var durationMs: Long = 0L
+    @Volatile private var positionMs: Long = 0L
+    @Volatile private var playing: Boolean = false
+    @Volatile private var hostState: String = ""
+    @Volatile private var sequence: Long = 0L
+    @Volatile private var updatedAtMs: Long = System.currentTimeMillis()
+
+    /** 歌词时间轴。整块替换，不原地修改，避免读到半更新的列表。 */
+    @Volatile private var lyrics: List<PlaybackExtensionPoint.LyricsLine> = emptyList()
+
+    fun setPlaying(value: Boolean) {
+        playing = value
+        bump()
+    }
+
+    fun setPosition(value: Long) {
+        positionMs = if (value < 0L) 0L else value
+        bump()
+    }
+
+    fun setHostState(value: PlaybackExtensionPoint.State) {
+        hostState = value.name
+    }
+
+    /** 宿主换曲时调用，一次性更新全部曲目字段。 */
+    fun setMediaItem(item: PlaybackExtensionPoint.MediaItem?) {
+        if (item == null) {
+            title = ""
+            artist = ""
+            album = ""
+            durationMs = 0L
+        } else {
+            title = item.title
+            artist = item.artist
+            album = item.album
+            durationMs = if (item.duration < 0L) 0L else item.duration
+        }
+        // 换曲必须清空旧歌词，否则新歌会短暂显示上一首的内容
+        lyrics = emptyList()
+        bump()
+    }
+
+    fun setLyrics(lines: List<PlaybackExtensionPoint.LyricsLine>?) {
+        lyrics = lines ?: emptyList()
+        bump()
+    }
+
+    fun lyrics(): List<PlaybackExtensionPoint.LyricsLine> = lyrics
+
+    fun snapshot(): Snapshot = synchronized(this) {
+        Snapshot(
+            title = title,
+            artist = artist,
+            album = album,
+            durationMs = durationMs,
+            positionMs = positionMs,
+            playing = playing,
+            hostState = hostState,
+            hasLyric = lyrics.isNotEmpty(),
+            sequence = sequence,
+            updatedAtMs = System.currentTimeMillis(),
+        )
+    }
+
+    private fun bump() = synchronized(this) {
+        sequence++
+        updatedAtMs = System.currentTimeMillis()
+    }
+}
