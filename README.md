@@ -76,6 +76,38 @@ Cell(startTime, endTime, text)
 
 `pureSubText` 可空（无翻译时），`pureMainText` 非空。空列表统一表示「当前无可用时间轴」，换曲、重载、无歌词、加载失败都会如此，不能用通知次数推断加载次数。
 
+## 传输层：只能用 `java.base`
+
+**这是本工程最容易踩死的坑。** `com.sun.net.httpserver.HttpServer` 看起来是 JDK 自带的常规工具，但它属于 `jdk.httpserver` 模块，不在 `java.base` 里。Salt Player 用 jlink 裁剪过运行时，该模块被剔除了，插件加载时直接抛：
+
+```
+Link MC 启动失败：com/sun/net/httpserver/HttpServer
+```
+
+换成 `ServerSocket` 手写极简 HTTP/1.1 后正常。`java.base` 是任何 JVM 都必然具备的唯一模块，凡是不确定的 JDK 类都应先假定它可能不在。
+
+验证方式：
+
+```powershell
+# 从 spmod 解出 class 后检查模块归属
+jdeps -summary --multi-release 25 -cp <解出的目录> <解出的目录>
+# 期望输出只有 java.base
+```
+
+`BridgeServer` 的网络类全部来自 `java.net`，已用 `jdeps` 逐类确认。
+
+## 离线自检
+
+不需要安装到 Salt Player 就能验证桥接层：
+
+```powershell
+.\gradlew.bat selfCheck
+```
+
+覆盖 24 项：端口绑定、空快照结构、曲目字段、JSON 转义（引号与制表符）、位置与播放态、歌词能力动态声明、字级单元格数量、换曲清空旧歌词、404/405、命令白名单、畸形请求不崩、`stop()` 后端口释放。
+
+自检跑在完整 SE 运行时上，所以它能提前暴露「依赖了宿主没有的 JDK 模块」这类问题——但也**只能**覆盖到模块层面，jlink 裁剪的其它差异仍需实机验证。
+
 ## 桥接端点
 
 只绑定 `127.0.0.1:35400`，绝不监听 `0.0.0.0`。
@@ -91,7 +123,11 @@ POST /lyric/command    {"action":"next"} 等
 
 ## 设计取舍
 
-用 JDK 自带的 `com.sun.net.httpserver`，不引入任何第三方依赖。插件包体积敏感，宿主已提供完整 JDK，且有 JSON 序列化需求的部分只有固定几个字段——为它引入一个 JSON 库不划算。命令解析用字段名定位，输入来自本机回环且动作走白名单，风险可控。
+用 `java.base` 的 `ServerSocket` 手写极简 HTTP/1.1，不引入任何第三方依赖。插件包体积敏感，且有 JSON 序列化需求的部分只有固定几个字段——为它引入 Web 服务器或 JSON 库不划算，何况宿主运行时可能根本没有那些模块。
+
+每连接一请求即关闭（`Connection: close`），不做 keep-alive。轮询约每秒一次，复用连接的收益抵不过状态机的复杂度。
+
+命令解析用字段名定位，输入来自本机回环且动作走白名单。
 
 所有宿主回调都包在 `guard` 内。它们运行在宿主的多个线程上，一次未捕获异常就可能中断 Salt Player 的播放流程。桥接数据缺失远好于打断播放。
 
@@ -117,3 +153,4 @@ POST /lyric/command    {"action":"next"} 等
 - 端口 35400 被占用时的降级路径（当前表现为 toast 报错，未做自动换端口）
 - `onLyricsLinesUpdated` 与 `onLyricsLineUpdated` 同时启用时的时间基是否一致
 - 实测 `onPositionUpdated` 的实际回调频率与抖动幅度
+- 裁剪运行时里是否还缺其它非 `java.base` 模块（已确认的只有 `jdk.httpserver`）

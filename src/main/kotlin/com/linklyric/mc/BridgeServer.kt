@@ -1,111 +1,125 @@
 package com.linklyric.mc
 
-import com.sun.net.httpserver.HttpExchange
-import com.sun.net.httpserver.HttpServer
 import com.xuncorp.spw.workshop.api.PlaybackExtensionPoint
 import com.xuncorp.spw.workshop.api.WorkshopApi
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 本机回环桥接服务端。
  *
- * 用 JDK 自带的 HttpServer，不引入第三方依赖：插件包体积敏感，宿主已提供完整 JDK。
+ * 传输层只用 `java.base` 里的 [ServerSocket]，手写极简 HTTP/1.1。
+ * 不能用 `com.sun.net.httpserver`：它属于 `jdk.httpserver` 模块，
+ * 而 Salt Player 是 jlink 裁剪过的运行时，该模块可能不存在，
+ * 表现为 `NoClassDefFoundError: com/sun/net/httpserver/HttpServer`。
+ * `java.base` 是任何 JVM 都必然具备的模块，因此这里是唯一安全的选择。
  *
  * 只绑定 127.0.0.1，绝不监听 0.0.0.0。跨机场景需另行加配对码鉴权。
- * 采用短轮询而非 WebSocket：当前只需下发数据 + 接收低频命令，
- * 升级到长连接只有在命令量增大时才划算。
+ * 每个连接处理完即关闭（`Connection: close`），不做 keep-alive——
+ * 轮询频率约每秒一次，复用连接带来的收益抵不过状态机的复杂度。
  */
 class BridgeServer(
     private val port: Int,
     private val sourceId: String,
 ) {
 
-    private var server: HttpServer? = null
+    private var serverSocket: ServerSocket? = null
+    private var acceptThread: Thread? = null
     private val running = AtomicBoolean(false)
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
 
-        val srv = HttpServer.create(
-            InetSocketAddress(InetAddress.getByName("127.0.0.1"), port),
-            0,
-        )
-        // 单线程足够：每秒一次的 JSON 序列化，全部非阻塞
-        srv.executor = Executors.newSingleThreadExecutor { r ->
-            Thread(r, "link-mc-http").apply { isDaemon = true }
+        try {
+            val ss = ServerSocket()
+            // backlog 取小值即可：调用方只有本机的 Minecraft
+            ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 8)
+            // 设置超时，使 stop() 关闭后 accept 循环能及时退出
+            ss.soTimeout = 1000
+            serverSocket = ss
+            acceptThread = Thread({ acceptLoop(ss) }, "link-mc-http").apply {
+                isDaemon = true
+                start()
+            }
+        } catch (t: Throwable) {
+            running.set(false)
+            runCatching { serverSocket?.close() }
+            serverSocket = null
+            throw t
         }
-        // 主路径与命令子路径分开注册，避免路径匹配歧义
-        srv.createContext(BridgeConfig.HTTP_PATH) { ex -> route(ex) }
-        srv.createContext("${BridgeConfig.HTTP_PATH}/command") { ex -> handleCommand(ex) }
-        srv.start()
-        server = srv
     }
 
     fun stop() {
         if (!running.compareAndSet(true, false)) return
-        runCatching { server?.stop(0) }
-        server = null
+        // close 会让阻塞中的 accept 抛出异常，循环随即因 running=false 退出
+        runCatching { serverSocket?.close() }
+        runCatching { acceptThread?.interrupt() }
+        serverSocket = null
+        acceptThread = null
     }
 
-    fun boundPort(): Int = server?.address?.port ?: -1
+    fun boundPort(): Int = serverSocket?.localPort ?: -1
 
-    private fun route(exchange: HttpExchange) {
+    private fun acceptLoop(ss: ServerSocket) {
+        while (running.get()) {
+            try {
+                ss.accept().use { socket -> handle(socket) }
+            } catch (_: SocketTimeoutException) {
+                // 正常：用于周期性检查 running 标志
+            } catch (t: Throwable) {
+                // 单个连接出错不得终止整个服务
+                if (!running.get()) return
+                System.err.println("[Link MC] accept failed: ${t.message}")
+            }
+        }
+    }
+
+    private fun handle(socket: Socket) {
         try {
-            if (!isLoopback(exchange)) {
-                respond(exchange, 403, ERROR_FORBIDDEN)
+            if (!socket.inetAddress.isLoopbackAddress) {
+                writeResponse(socket.getOutputStream(), 403, ERROR_FORBIDDEN)
                 return
             }
-            if (exchange.requestURI.path.endsWith("/command")) {
-                handleCommand(exchange)
-            } else {
-                respond(exchange, 200, renderJson())
-            }
+            socket.soTimeout = 5_000
+            val request = readRequest(socket.getInputStream()) ?: return
+            val response = route(request)
+            writeResponse(socket.getOutputStream(), response.first, response.second)
         } catch (t: Throwable) {
-            runCatching { respond(exchange, 500, ERROR_INTERNAL) }
-        } finally {
-            exchange.close()
+            runCatching { writeResponse(socket.getOutputStream(), 500, ERROR_INTERNAL) }
+        }
+    }
+
+    private fun route(request: Request): Pair<Int, String> {
+        val path = request.path
+        return when {
+            path.endsWith("/command") -> {
+                if (request.method != "POST") {
+                    405 to """{"error":"method not allowed"}"""
+                } else {
+                    200 to """{"ok":${dispatch(request.body)}}"""
+                }
+            }
+            path.endsWith("/lyric") || path == "/" -> 200 to renderJson()
+            else -> 404 to """{"error":"not found"}"""
         }
     }
 
     /**
-     * 命令入口。仅接受 POST，动作从严白名单。
+     * 命令分发。动作走严格白名单。
      *
-     * 宿主播放控制接口只有 play/pause/previous/next/seekTo，
-     * 没有「按索引播放」，因此这里也不暴露 playAt——虚报能力会让
-     * MC 端显示无法实现的功能。
-     */
-    private fun handleCommand(exchange: HttpExchange) {
-        try {
-            if (!isLoopback(exchange)) {
-                respond(exchange, 403, ERROR_FORBIDDEN)
-                return
-            }
-            if (exchange.requestMethod != "POST") {
-                respond(exchange, 405, """{"error":"method not allowed"}""")
-                return
-            }
-            val body = exchange.requestBody.readBytes().toString(StandardCharsets.UTF_8)
-            val ok = dispatch(body)
-            respond(exchange, 200, """{"ok":$ok}""")
-        } catch (t: Throwable) {
-            runCatching { respond(exchange, 500, ERROR_INTERNAL) }
-        } finally {
-            exchange.close()
-        }
-    }
-
-    /**
-     * 极简命令解析。
-     *
-     * 不引入 JSON 库（会把依赖打进插件包），因此按字段名定位值。
-     * 输入来自本机回环、且动作走白名单，风险可控。
+     * 宿主 `Playback` 接口只有 play/pause/previous/next/seekTo，
+     * 没有「按索引播放」，因此这里也不暴露 playAt。
      */
     private fun dispatch(body: String): Boolean {
+        if (body.isEmpty()) return false
         val playback: WorkshopApi.Playback =
             runCatching { WorkshopApi.playback }.getOrNull() ?: return false
         val action = extractString(body, "action") ?: return false
@@ -132,8 +146,101 @@ class BridgeServer(
         }
     }
 
-    private fun isLoopback(exchange: HttpExchange): Boolean =
-        exchange.remoteAddress?.address?.isLoopbackAddress ?: false
+    // ---------------- 极简 HTTP/1.1 ----------------
+
+    private data class Request(val method: String, val path: String, val body: String)
+
+    /** 单次请求头部上限。请求来自本机，恶意放大不该被容忍。 */
+    private val maxHeaderBytes = 8 * 1024
+
+    /** 单次请求体上限。命令只含 action 与一个数字，1 KB 绰绰有余。 */
+    private val maxBodyBytes = 1 * 1024
+
+    /**
+     * 读取一个完整请求。
+     *
+     * 逐字节读到 `\r\n\r\n` 为止，再按 `Content-Length` 读 body。
+     * 不能用 BufferedReader：字符解码会吞掉 body 的原始字节。
+     */
+    private fun readRequest(input: InputStream): Request? {
+        val header = ByteArrayOutputStream(512)
+        var matched = 0
+        while (true) {
+            val b = input.read()
+            if (b < 0) return null
+            header.write(b)
+
+            // 逐字节推进 \r\n\r\n 的匹配状态机
+            matched = when {
+                b == CR && matched == 0 -> 1
+                b == LF && matched == 1 -> 2
+                b == CR && matched == 2 -> 3
+                b == LF && matched == 3 -> 4
+                b == CR -> 1
+                else -> 0
+            }
+            if (matched == 4) break
+            if (header.size() > maxHeaderBytes) return null
+        }
+
+        val text = header.toString(StandardCharsets.ISO_8859_1.name())
+        val lines = text.split("\r\n")
+        val requestLine = lines.firstOrNull()?.split(' ') ?: return null
+        if (requestLine.size < 2) return null
+
+        val method = requestLine[0]
+        val path = requestLine[1].substringBefore('?')
+
+        var contentLength = 0
+        for (line in lines) {
+            val idx = line.indexOf(':')
+            if (idx <= 0) continue
+            if (line.substring(0, idx).equals("Content-Length", ignoreCase = true)) {
+                contentLength = line.substring(idx + 1).trim().toIntOrNull() ?: 0
+            }
+        }
+
+        val body = if (contentLength > 0) {
+            val size = contentLength.coerceAtMost(maxBodyBytes)
+            val buf = ByteArray(size)
+            var read = 0
+            while (read < size) {
+                val n = input.read(buf, read, size - read)
+                if (n < 0) break
+                read += n
+            }
+            String(buf, 0, read, StandardCharsets.UTF_8)
+        } else {
+            ""
+        }
+
+        return Request(method, path, body)
+    }
+
+    private fun writeResponse(out: OutputStream, code: Int, body: String) {
+        val bytes = body.toByteArray(StandardCharsets.UTF_8)
+        val head = buildString(128) {
+            append("HTTP/1.1 ").append(code).append(' ').append(statusText(code)).append("\r\n")
+            append("Content-Type: application/json; charset=utf-8\r\n")
+            append("Content-Length: ").append(bytes.size).append("\r\n")
+            append("Cache-Control: no-store\r\n")
+            append("Connection: close\r\n")
+            append("\r\n")
+        }
+        out.write(head.toByteArray(StandardCharsets.US_ASCII))
+        out.write(bytes)
+        out.flush()
+    }
+
+    private fun statusText(code: Int): String = when (code) {
+        200 -> "OK"
+        403 -> "Forbidden"
+        404 -> "Not Found"
+        405 -> "Method Not Allowed"
+        else -> "Internal Server Error"
+    }
+
+    // ---------------- JSON 序列化 ----------------
 
     private fun renderJson(): String {
         val s = PlaybackState.INSTANCE.snapshot()
@@ -162,7 +269,7 @@ class BridgeServer(
      * 歌词序列化。结构对齐 MC 端 LyricLine：
      * 行含 start/end/主文本/副文本，words 为字级时间轴。
      *
-     * 宿主 LyricLine 的 lyricsCells 已带每字时间，直接映射即可，
+     * 宿主 LyricsLine 的 lyricsCells 已带每字时间，直接映射，
      * 无需在 MC 端二次切分。
      */
     private fun renderLyric(): String {
@@ -174,7 +281,7 @@ class BridgeServer(
                 if (i > 0) append(',')
                 append('{')
                 append("\"text\":\"").append(escape(line.pureMainText)).append('"')
-                // pureSubText 在 API 中为可空（无翻译时），必须兜底
+                // pureSubText 在 API 中可空（无翻译时），必须兜底
                 append(",\"translation\":\"").append(escape(line.pureSubText ?: "")).append('"')
                 append(",\"startMs\":").append(line.startTime)
                 append(",\"endMs\":").append(line.endTime)
@@ -208,14 +315,6 @@ class BridgeServer(
         } else {
             "[$base]"
         }
-    }
-
-    private fun respond(exchange: HttpExchange, code: Int, body: String) {
-        val bytes = body.toByteArray(StandardCharsets.UTF_8)
-        exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
-        exchange.responseHeaders.add("Cache-Control", "no-store")
-        exchange.sendResponseHeaders(code, bytes.size.toLong())
-        exchange.responseBody.use { out: OutputStream -> out.write(bytes) }
     }
 
     /** 最小 JSON 转义。曲目名常含引号与反斜杠，不转义会产生非法 JSON。 */
@@ -256,17 +355,18 @@ class BridgeServer(
         if (i < 0) return null
         val colon = body.indexOf(':', i + marker.length)
         if (colon < 0) return null
-        val end = body.indexOfFirst(colon + 1) { it == ',' || it == '}' }
+        var end = -1
+        for (idx in (colon + 1) until body.length) {
+            val c = body[idx]
+            if (c == ',' || c == '}') { end = idx; break }
+        }
         val raw = body.substring(colon + 1, if (end < 0) body.length else end).trim()
         return raw.toLongOrNull()
     }
 
-    private inline fun String.indexOfFirst(from: Int, pred: (Char) -> Boolean): Int {
-        for (idx in from until length) if (pred(this[idx])) return idx
-        return -1
-    }
-
     private companion object {
+        const val CR = '\r'.code
+        const val LF = '\n'.code
         const val ERROR_FORBIDDEN = """{"error":"loopback only"}"""
         const val ERROR_INTERNAL = """{"error":"internal"}"""
     }

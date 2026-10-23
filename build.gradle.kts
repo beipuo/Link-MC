@@ -18,6 +18,16 @@ kotlin {
     jvmToolchain(25)
 }
 
+/**
+ * 自检源码集：把主代码与自检代码一起编到独立 classpath，
+ * 不参与 spmod 打包，因此不会影响插件包体积。
+ */
+val selfCheck: SourceSet = sourceSets.create("selfCheck") {
+    kotlin.srcDir("src/selfCheck/kotlin")
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
 dependencies {
     // API 与 Kotlin 标准库由 Salt Player 宿主提供，compileOnly 避免重复打入插件包
     compileOnly(kotlin("stdlib"))
@@ -25,8 +35,13 @@ dependencies {
     // 处理 @Extension 注解，生成 PF4J 扩展索引
     kapt(libs.spw.workshop.api)
 
-    // 需要随插件分发的依赖用 implementation。
-    // 暂不引入任何第三方库：桥接只需 JDK 自带的 Socket / NIO。
+    // 自检需要真实 API 类型构造歌词对象，且需要 SE 运行时（而非裁剪运行时）
+    "selfCheckImplementation"(kotlin("stdlib"))
+    "selfCheckImplementation"(libs.spw.workshop.api)
+
+    // 插件本体不引入任何第三方库：桥接只用 java.base 的 ServerSocket。
+    // 不能用 com.sun.net.httpserver —— 它属于 jdk.httpserver 模块，
+    // 而 Salt Player 用 jlink 裁剪运行时，该模块不一定存在。
 }
 
 tasks.withType<JavaCompile>().configureEach {
@@ -37,6 +52,20 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach 
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_25)
     }
+}
+
+/**
+ * 离线自检：不安装插件、不启动 Salt Player，直接验证桥接层行为。
+ *
+ * 用完整 SE 运行时执行，因此能及早发现「依赖了宿主没有的 JDK 模块」
+ * 这类只在实机才暴露的问题。
+ */
+tasks.register<JavaExec>("selfCheck") {
+    group = "verification"
+    description = "在本地 JVM 上验证桥接层，无需安装到 Salt Player"
+    dependsOn(tasks.named("selfCheckClasses"))
+    mainClass.set("com.linklyric.mc.selfcheck.SelfCheck")
+    classpath = selfCheck.runtimeClasspath
 }
 
 spmod {
