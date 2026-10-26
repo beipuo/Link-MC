@@ -157,6 +157,9 @@ object SelfCheck {
                 + " 比值=" + String.format("%.1f%%", ratio * 100))
             check("大规模下省略后不到原文一成", ratio < 0.1)
 
+            // 连接复用：同一条 TCP 连接上连续两个请求都必须被正确应答
+            checkReuse(port)
+
             // 7. 未知路径
             check("未知路径返回 404", status(port, "/nope") == 404)
 
@@ -209,6 +212,66 @@ object SelfCheck {
         conn.connectTimeout = 2000
         conn.readTimeout = 2000
         return conn.inputStream.bufferedReader().use { it.readText() }
+    }
+
+    /**
+     * 在一条连接上连发两个请求，验证长连接真的生效。
+     *
+     * <p>判据看响应头：服务端愿意复用时回 {@code Connection: keep-alive}，
+     * 而不是看耗时——耗时在回环上噪音太大，测不出稳定差异。
+     */
+    private fun checkReuse(port: Int) {
+        java.net.Socket("127.0.0.1", port).use { socket ->
+            socket.soTimeout = 3000
+            val out = socket.getOutputStream()
+            // 必须按字节读：Content-Length 是字节数，而歌词含中文，
+            // 用 Reader 按字符读会让剩余字节错位，把下一个响应吃掉。
+            val input = socket.getInputStream()
+
+            fun readLine(): String {
+                val sb = StringBuilder()
+                while (true) {
+                    val b = input.read()
+                    if (b < 0) return sb.toString()
+                    if (b == '\n'.code) return sb.toString()
+                    if (b != '\r'.code) sb.append(b.toChar())
+                }
+            }
+
+            fun requestOnce(): String {
+                out.write(
+                    ("GET /lyric HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+                        "Connection: keep-alive\r\n\r\n").toByteArray(),
+                )
+                out.flush()
+                val headers = StringBuilder()
+                while (true) {
+                    val line = readLine()
+                    if (line.isEmpty()) break
+                    headers.append(line).append('\n')
+                }
+                val len = headers.lineSequence()
+                    .firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
+                    ?.substringAfter(':')?.trim()?.toIntOrNull() ?: 0
+                // 按字节精确吃掉正文，保证下一次读从头对齐
+                var remaining = len
+                val scratch = ByteArray(4096)
+                while (remaining > 0) {
+                    val n = input.read(scratch, 0, minOf(scratch.size, remaining))
+                    if (n < 0) break
+                    remaining -= n
+                }
+                return headers.toString()
+            }
+
+            val first = requestOnce()
+            check("首个请求声明可复用", first.contains("keep-alive", ignoreCase = true))
+
+            // 关键一步：同一条 socket 上再发一次。若服务端已收线，
+            // 这里会读到空行或直接抛异常。
+            val second = runCatching { requestOnce() }.getOrDefault("")
+            check("同一连接上第二个请求被应答", second.contains("HTTP/1.1 200"))
+        }
     }
 
     /** 一次 GET 的结果：正文与 ETag。 */

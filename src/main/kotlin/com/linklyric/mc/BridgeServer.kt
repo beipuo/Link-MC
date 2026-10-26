@@ -36,6 +36,14 @@ class BridgeServer(
     private var acceptThread: Thread? = null
     private val running = AtomicBoolean(false)
 
+    /**
+     * 存活的连接。stop() 时要逐个关闭，否则插件的连接线程会攥着
+     * 已 accept 的 socket 不放，反复启停会累积。
+     */
+    private val connections = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<Socket, Boolean>(),
+    )
+
     fun start() {
         if (!running.compareAndSet(false, true)) return
 
@@ -63,6 +71,11 @@ class BridgeServer(
         // close 会让阻塞中的 accept 抛出异常，循环随即因 running=false 退出
         runCatching { serverSocket?.close() }
         runCatching { acceptThread?.interrupt() }
+        // 长连接不会被 accept 的关闭带走，得自己收尾
+        for (socket in connections.toList()) {
+            runCatching { socket.close() }
+        }
+        connections.clear()
         serverSocket = null
         acceptThread = null
     }
@@ -72,7 +85,15 @@ class BridgeServer(
     private fun acceptLoop(ss: ServerSocket) {
         while (running.get()) {
             try {
-                ss.accept().use { socket -> handle(socket) }
+                val socket = ss.accept()
+                // 每个连接一个线程。这不是过度设计，而是长连接的必要条件：
+                // 单线程同步处理时，一条 keep-alive 连接会永久占住 accept 循环，
+                // 第二个客户端（另一个实例、curl 诊断）永远接不进来。
+                connections.add(socket)
+                Thread({ serveConnection(socket) }, "link-mc-conn").apply {
+                    isDaemon = true
+                    start()
+                }
             } catch (_: SocketTimeoutException) {
                 // 正常：用于周期性检查 running 标志
             } catch (t: Throwable) {
@@ -80,6 +101,65 @@ class BridgeServer(
                 if (!running.get()) return
                 System.err.println("[Link MC] accept failed: ${t.message}")
             }
+        }
+    }
+
+    /**
+     * 在一条连接上循环处理请求。
+     *
+     * <p>此前每个连接只处理一次请求就关闭（`Connection: close`）。
+     * 那让客户端侧整套连接复用逻辑完全失效：模组每 200ms 轮询一次，
+     * 每轮都新建一条 TCP 连接，一分钟 300 次，Windows 上还会堆积 TIME_WAIT。
+     *
+     * <p>现在按 HTTP/1.1 的约定处理：默认复用，除非任一方要求关闭。
+     * 空闲超时短于排障用的请求超时——长连接的等待是「正常无事可做」，
+     * 不该和「请求迟迟不返回」用同一个阈值。
+     */
+    private fun serveConnection(socket: Socket) {
+        try {
+            socket.use {
+                if (!socket.inetAddress.isLoopbackAddress) {
+                    writeResponse(socket.getOutputStream(), 403, ERROR_FORBIDDEN)
+                    return
+                }
+                while (running.get() && !socket.isClosed) {
+                    // 空闲等待：客户端下次轮询在 200ms 后，2 秒足够覆盖抖动
+                    socket.soTimeout = KEEPALIVE_IDLE_MS
+                    val request = try {
+                        readRequest(socket.getInputStream())
+                    } catch (_: SocketTimeoutException) {
+                        // 空闲超时：正常收线，不是错误
+                        return
+                    } ?: return
+
+                    // 请求体处理阶段用更宽的阈值：写响应不该被空闲超时打断
+                    socket.soTimeout = REQUEST_TIMEOUT_MS
+                    val response = try {
+                        route(request)
+                    } catch (t: Throwable) {
+                        // 处理失败后连接状态已不可信，回 500 并收线
+                        runCatching {
+                            writeResponse(socket.getOutputStream(), 500, ERROR_INTERNAL)
+                        }
+                        return
+                    }
+
+                    val keepAlive = response.code != 500 && request.wantsKeepAlive
+                    writeResponse(
+                        socket.getOutputStream(),
+                        response.code,
+                        response.body,
+                        response.lyricEtag,
+                        keepAlive,
+                    )
+                    if (!keepAlive) return
+                }
+            }
+        } catch (t: Throwable) {
+            // 对端异常断开是常态（游戏退出、进程被杀），不当作故障
+        } finally {
+            connections.remove(socket)
+            runCatching { socket.close() }
         }
     }
 
@@ -170,6 +250,8 @@ class BridgeServer(
         val body: String,
         /** 客户端上次收到的歌词指纹；null 表示首次请求或客户端不支持条件请求。 */
         val ifNoneMatch: String? = null,
+        /** 客户端是否愿意复用连接。缺省按 HTTP/1.1 视为愿意。 */
+        val wantsKeepAlive: Boolean = true,
     )
 
     /** 单次请求头部上限。请求来自本机，恶意放大不该被容忍。 */
@@ -215,6 +297,8 @@ class BridgeServer(
 
         var contentLength = 0
         var ifNoneMatch: String? = null
+        // HTTP/1.1 默认复用；只有显式 close（或 HTTP/1.0 未声明 keep-alive）才收线
+        var wantsKeepAlive = requestLine.getOrNull(2) != "HTTP/1.0"
         for (line in lines) {
             val idx = line.indexOf(':')
             if (idx <= 0) continue
@@ -226,6 +310,13 @@ class BridgeServer(
                 name.equals("If-None-Match", ignoreCase = true) ->
                     // 去掉可能存在的弱校验前缀 W/ 与引号，只留裸指纹
                     ifNoneMatch = value.removePrefix("W/").trim('"').ifEmpty { null }
+                name.equals("Connection", ignoreCase = true) -> {
+                    // 逐个 token 判定：只要出现 close 就收线（它优先于 keep-alive），
+                    // 否则出现 keep-alive 才复用。写成单个 any{} 会把
+                    // 「keep-alive, close」误判成可复用。
+                    val tokens = value.split(',').map { it.trim().lowercase() }
+                    wantsKeepAlive = "close" !in tokens && "keep-alive" in tokens
+                }
             }
         }
 
@@ -243,7 +334,7 @@ class BridgeServer(
             ""
         }
 
-        return Request(method, path, body, ifNoneMatch)
+        return Request(method, path, body, ifNoneMatch, wantsKeepAlive)
     }
 
     private fun writeResponse(
@@ -251,23 +342,24 @@ class BridgeServer(
         code: Int,
         body: String,
         lyricEtag: String? = null,
+        keepAlive: Boolean = false,
     ) {
-        val bytes = body.toByteArray(StandardCharsets.UTF_8)
+        val bodyBytes = body.toByteArray(StandardCharsets.UTF_8)
         val head = buildString(192) {
             append("HTTP/1.1 ").append(code).append(' ').append(statusText(code)).append("\r\n")
             append("Content-Type: application/json; charset=utf-8\r\n")
-            append("Content-Length: ").append(bytes.size).append("\r\n")
+            append("Content-Length: ").append(bodyBytes.size).append("\r\n")
             // 原先固定发 no-store，等于明令禁止任何缓存，与条件请求直接冲突。
             // 时效性改由歌词指纹自行校验，不必再让中间层无条件丢弃整份响应。
             append("Cache-Control: no-cache\r\n")
             if (lyricEtag != null) {
                 append("ETag: \"").append(lyricEtag).append("\"\r\n")
             }
-            append("Connection: close\r\n")
+            append(if (keepAlive) "Connection: keep-alive\r\n" else "Connection: close\r\n")
             append("\r\n")
         }
         out.write(head.toByteArray(StandardCharsets.US_ASCII))
-        out.write(bytes)
+        out.write(bodyBytes)
         out.flush()
     }
 
@@ -443,6 +535,17 @@ class BridgeServer(
     private companion object {
         const val CR = '\r'.code
         const val LF = '\n'.code
+
+        /**
+         * 长连接的空闲等待。客户端轮询间隔约 200ms，超出即认为它已离开。
+         *
+         * <p>短于单个请求的处理上限：空闲等待意味着「正常无事可做」，
+         * 与「请求迟迟不返回」不是同一类超时，不该共用一个阈值。
+         */
+        const val KEEPALIVE_IDLE_MS = 2_000
+
+        /** 单个请求从解析到写响应的时间上限。 */
+        const val REQUEST_TIMEOUT_MS = 5_000
         const val ERROR_FORBIDDEN = """{"error":"loopback only"}"""
         const val ERROR_INTERNAL = """{"error":"internal"}"""
     }
