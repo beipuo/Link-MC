@@ -1,6 +1,7 @@
 package com.linklyric.mc
 
 import com.xuncorp.spw.workshop.api.PlaybackExtensionPoint
+import com.xuncorp.spw.workshop.api.PlaybackExtensionPoint.LyricsLine
 import com.xuncorp.spw.workshop.api.WorkshopApi
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -91,24 +92,39 @@ class BridgeServer(
             socket.soTimeout = 5_000
             val request = readRequest(socket.getInputStream()) ?: return
             val response = route(request)
-            writeResponse(socket.getOutputStream(), response.first, response.second)
+            writeResponse(socket.getOutputStream(), response.code, response.body, response.lyricEtag)
         } catch (t: Throwable) {
             runCatching { writeResponse(socket.getOutputStream(), 500, ERROR_INTERNAL) }
         }
     }
 
-    private fun route(request: Request): Pair<Int, String> {
+    /** 一次响应：状态码、正文，以及歌词子树的指纹（仅 /lyric 有）。 */
+    private data class Response(
+        val code: Int,
+        val body: String,
+        val lyricEtag: String? = null,
+    )
+
+    private fun route(request: Request): Response {
         val path = request.path
         return when {
             path.endsWith("/command") -> {
                 if (request.method != "POST") {
-                    405 to """{"error":"method not allowed"}"""
+                    Response(405, """{"error":"method not allowed"}""")
                 } else {
-                    200 to """{"ok":${dispatch(request.body)}}"""
+                    Response(200, """{"ok":${dispatch(request.body)}}""")
                 }
             }
-            path.endsWith("/lyric") || path == "/" -> 200 to renderJson()
-            else -> 404 to """{"error":"not found"}"""
+            path.endsWith("/lyric") || path == "/" -> {
+                val lyric = cachedLyric()
+                val unchanged = request.ifNoneMatch != null && request.ifNoneMatch == lyric.etag
+                Response(
+                    code = 200,
+                    body = renderSnapshot(if (unchanged) null else lyric),
+                    lyricEtag = lyric.etag,
+                )
+            }
+            else -> Response(404, """{"error":"not found"}""")
         }
     }
 
@@ -148,7 +164,13 @@ class BridgeServer(
 
     // ---------------- 极简 HTTP/1.1 ----------------
 
-    private data class Request(val method: String, val path: String, val body: String)
+    private data class Request(
+        val method: String,
+        val path: String,
+        val body: String,
+        /** 客户端上次收到的歌词指纹；null 表示首次请求或客户端不支持条件请求。 */
+        val ifNoneMatch: String? = null,
+    )
 
     /** 单次请求头部上限。请求来自本机，恶意放大不该被容忍。 */
     private val maxHeaderBytes = 8 * 1024
@@ -192,11 +214,18 @@ class BridgeServer(
         val path = requestLine[1].substringBefore('?')
 
         var contentLength = 0
+        var ifNoneMatch: String? = null
         for (line in lines) {
             val idx = line.indexOf(':')
             if (idx <= 0) continue
-            if (line.substring(0, idx).equals("Content-Length", ignoreCase = true)) {
-                contentLength = line.substring(idx + 1).trim().toIntOrNull() ?: 0
+            val name = line.substring(0, idx)
+            val value = line.substring(idx + 1).trim()
+            when {
+                name.equals("Content-Length", ignoreCase = true) ->
+                    contentLength = value.toIntOrNull() ?: 0
+                name.equals("If-None-Match", ignoreCase = true) ->
+                    // 去掉可能存在的弱校验前缀 W/ 与引号，只留裸指纹
+                    ifNoneMatch = value.removePrefix("W/").trim('"').ifEmpty { null }
             }
         }
 
@@ -214,16 +243,26 @@ class BridgeServer(
             ""
         }
 
-        return Request(method, path, body)
+        return Request(method, path, body, ifNoneMatch)
     }
 
-    private fun writeResponse(out: OutputStream, code: Int, body: String) {
+    private fun writeResponse(
+        out: OutputStream,
+        code: Int,
+        body: String,
+        lyricEtag: String? = null,
+    ) {
         val bytes = body.toByteArray(StandardCharsets.UTF_8)
-        val head = buildString(128) {
+        val head = buildString(192) {
             append("HTTP/1.1 ").append(code).append(' ').append(statusText(code)).append("\r\n")
             append("Content-Type: application/json; charset=utf-8\r\n")
             append("Content-Length: ").append(bytes.size).append("\r\n")
-            append("Cache-Control: no-store\r\n")
+            // 原先固定发 no-store，等于明令禁止任何缓存，与条件请求直接冲突。
+            // 时效性改由歌词指纹自行校验，不必再让中间层无条件丢弃整份响应。
+            append("Cache-Control: no-cache\r\n")
+            if (lyricEtag != null) {
+                append("ETag: \"").append(lyricEtag).append("\"\r\n")
+            }
             append("Connection: close\r\n")
             append("\r\n")
         }
@@ -242,9 +281,40 @@ class BridgeServer(
 
     // ---------------- JSON 序列化 ----------------
 
-    private fun renderJson(): String {
+    /** 歌词子树的序列化结果与指纹。同一份内容只算一次。 */
+    private data class CachedLyric(val etag: String, val json: String)
+
+    /**
+     * 歌词序列化缓存。
+     *
+     * <p>此前每轮轮询都完整重建一次歌词 JSON：40 行带逐字时间约 25 KB，
+     * 实测 62.7 微秒，而这份内容在换曲之前是完全不变的。
+     * 轮询频率 5 Hz，等于每秒白做 5 次。
+     *
+     * <p>只缓存这一项，不缓存整份响应：positionMs、seq 每轮都变，
+     * 缓存整份响应会让位置冻结。
+     *
+     * <p>指纹取歌词 JSON 的哈希。它与内容一一对应，
+     * 客户端据此判断是否需要重新解析时间轴。
+     */
+    @Volatile private var lyricCache: CachedLyric? = null
+    @Volatile private var lyricCacheSource: List<PlaybackExtensionPoint.LyricsLine>? = null
+
+    private fun cachedLyric(): CachedLyric {
+        val lines = PlaybackState.INSTANCE.lyrics()
+        // 宿主的歌词列表整块替换，引用相等即可判定未变；换了就重算。
+        val cached = lyricCache
+        if (cached != null && lyricCacheSource === lines) return cached
+        val json = renderLyric(lines)
+        val fresh = CachedLyric(etag = Integer.toHexString(json.hashCode()), json = json)
+        lyricCacheSource = lines
+        lyricCache = fresh
+        return fresh
+    }
+
+    private fun renderSnapshot(lyric: CachedLyric?): String {
         val s = PlaybackState.INSTANCE.snapshot()
-        return buildString(2048) {
+        return buildString(2048 + (lyric?.json?.length ?: 0)) {
             append("{\"v\":").append(BridgeConfig.PROTOCOL_VERSION)
             append(",\"type\":\"snapshot\"")
             append(",\"sourceId\":\"").append(escape(sourceId)).append('"')
@@ -260,7 +330,14 @@ class BridgeServer(
             append(",\"album\":\"").append(escape(s.album)).append('"')
             append(",\"durationMs\":").append(s.durationMs)
             append('}')
-            append(",\"lyric\":").append(renderLyric())
+            if (lyric == null) {
+                // 客户端已有同一份歌词：明确告知不变，并宣布不再支持旧版能力，
+                // 让客户端知道字段存在但被省略，而不是以为歌词消失了。
+                append(",\"lyricOmitted\":true")
+            } else {
+                append(",\"lyricOmitted\":false")
+                append(",\"lyric\":").append(lyric.json)
+            }
             append('}')
         }
     }
@@ -272,8 +349,7 @@ class BridgeServer(
      * 宿主 LyricsLine 的 lyricsCells 已带每字时间，直接映射，
      * 无需在 MC 端二次切分。
      */
-    private fun renderLyric(): String {
-        val lines = PlaybackState.INSTANCE.lyrics()
+    private fun renderLyric(lines: List<PlaybackExtensionPoint.LyricsLine>): String {
         if (lines.isEmpty()) return "{\"wordLevel\":false,\"lines\":[]}"
         return buildString(lines.size * 96) {
             append("{\"wordLevel\":true,\"lines\":[")
